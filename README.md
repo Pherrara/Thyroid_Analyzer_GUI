@@ -173,8 +173,6 @@ Where:
 
 ![dosimetry dashboard image](images/dosimetry1.png)
 ![dosimetry dashboard image](images/dosimetry2.png)
-![dosimetry dashboard image](images/dosimetry3.png)
-
 
 ---
 
