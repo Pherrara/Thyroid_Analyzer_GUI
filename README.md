@@ -245,6 +245,14 @@ Potential extensions include:
 
 ---
 
+# Credits
+
+Alessandro Michele Ferrara - Department of Physics and Astronomy "Galileo Galilei", University of Padua, Padua - Department of Medical Physics, Azienda Sanitaria Universitaria Giuliano Isontina (ASUGI), Trieste
+
+Sara Savatović - Department of Physics and Astronomy "Galileo Galilei", University of Padua, Padua - Department of Medical Physics, Azienda Sanitaria Universitaria Giuliano Isontina (ASUGI), Trieste 
+
+---
+
 
 # Disclaimer
 
