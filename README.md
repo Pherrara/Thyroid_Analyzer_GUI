@@ -256,6 +256,6 @@ Sara Savatović - Department of Physics and Astronomy "Galileo Galilei", Univers
 
 # Disclaimer
 
-Clinical decisions must always be verified by qualified medical physicist experts and medical professionals.
+Clinical decisions must always be verified by qualified medical physics experts and medical professionals.
 
 
