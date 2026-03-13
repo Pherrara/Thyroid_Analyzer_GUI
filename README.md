@@ -97,9 +97,9 @@ The total thyroid volume is the sum of the two lobes.
 
 The software allows for manual volume override, useful for challenging cases where elliptic fitting fails, or for accomodating clinical indications requiring single-lobe consideration
 
-![volume dashboard image(./images/volume1)
-![volume dashboard image(./images/volume2)
-![volume dashboard image(./images/volume3)
+![volume dashboard image](images/volume1.png)
+![volume dashboard image](images/volume2.png)
+![volume dashboard image](images/volume3.png)
 
 ---
 
@@ -148,9 +148,9 @@ where:
 In hyperthyroidism therapy, the thyroid acts as both **source and target organ**, simplifying the dosimetric model.
 
 
-![uptake dashboard image(./images/uptake1)
-![uptake dashboard image(./images/uptake2)
-![uptake dashboard image(./images/uptake3)
+![uptake dashboard image](images/uptake1.png)
+![uptake dashboard image](images/uptake2.png)
+![uptake dashboard image](images/uptake3.png)
 
 ---
 
@@ -171,10 +171,10 @@ Where:
 | $U_{max}$       | Maximum iodine uptake           |
 | $T_{1/2}^{eff}$ | Effective half-life             |
 
+![dosimetry dashboard image](images/dosimetry1.png)
+![dosimetry dashboard image](images/dosimetry2.png)
+![dosimetry dashboard image](images/dosimetry3.png)
 
-![dosimetry dashboard image(./images/dosimetry1)
-![dosimetry dashboard image(./images/dosimetry2)
-![dosimetry dashboard image(./images/dosimetry3)
 
 ---
 
@@ -190,8 +190,8 @@ The software automatically generates a **standardized PDF report** containing:
   
 Note that the text in the PDF report has been personalized for the ASUGI hospital at Trieste, Italy, but can be easily customized in the source code by end-users for different hospitals.
 
-![report generation image(./images/report1)
-![report generation image(./images/report2)
+![report generation image](images/report1.png)
+![report generation image](images/report2.png)
 
 ---
 
