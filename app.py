@@ -2,6 +2,8 @@ import streamlit as st
 import numpy as np
 import os
 import scipy.ndimage as ndi
+import matplotlib
+matplotlib.use('Agg')   # non-interactive backend: no GUI overhead
 import matplotlib.pyplot as plt
 import pydicom as pyd
 from matplotlib.patches import Ellipse
@@ -283,9 +285,14 @@ def fit_ellipse_fast(mask):
     (x, y), (major, minor), angle = cv2.fitEllipse(cnt)
     return (x, y), major / 2, minor / 2, angle
 
-def analyze_volume_image(dcm_data, threshold, smoothing_sigma, kernel_size, padding, radius):
-    """Complete volume analysis pipeline"""
-    volume_img = dcm_data.pixel_array
+@st.cache_data(show_spinner=False)
+def analyze_volume_image(pixel_array, threshold, smoothing_sigma, kernel_size, padding, radius):
+    """Complete volume analysis pipeline.
+    
+    Accepts the raw pixel array (numpy array) instead of the full DICOM object
+    so that st.cache_data can hash the input reliably.
+    """
+    volume_img = pixel_array
     
     kernel = create_gaussian_kernel(kernel_size)
     volume_img_smooth = ndi.convolve(volume_img, kernel)
@@ -402,15 +409,23 @@ def expand_rectangle(rectangle_coords, image_shape, expansion_x, expansion_y):
     return expanded_mask, (x_min_new, x_max_new, y_min_new, y_max_new)
 
 def shift_mask_to_image_barycenter(image_data, mask):
-    """Shift mask to align with image barycenter"""
-    y_indices, x_indices = np.indices(image_data.shape)
+    """Shift mask to align with image barycenter.
+    
+    Uses direct weighted-sum formula instead of np.indices to avoid
+    allocating two full-image coordinate arrays.
+    """
     total_intensity = np.sum(image_data)
     
     if total_intensity == 0:
-        y_c, x_c = np.array(image_data.shape) / 2
+        y_c, x_c = np.array(image_data.shape) / 2.0
     else:
-        y_c = np.sum(y_indices * image_data) / total_intensity
-        x_c = np.sum(x_indices * image_data) / total_intensity
+        rows = np.arange(image_data.shape[0], dtype=np.float64)
+        cols = np.arange(image_data.shape[1], dtype=np.float64)
+        # Marginal sums avoid the full outer-product allocation
+        row_sum = image_data.sum(axis=1)   # shape (H,)
+        col_sum = image_data.sum(axis=0)   # shape (W,)
+        y_c = np.dot(rows, row_sum) / total_intensity
+        x_c = np.dot(cols, col_sum) / total_intensity
     
     y_mask_indices, x_mask_indices = np.where(mask)
     if len(x_mask_indices) == 0:
@@ -632,6 +647,83 @@ def generate_pdf_report(fisico, nome, data_nascita, data_acquisizione,
 
     return buf
 
+# ==================== CACHED HELPERS ====================
+
+@st.cache_data(show_spinner=False)
+def load_dicom_pixels(file_bytes: bytes) -> np.ndarray:
+    """Read a DICOM file from raw bytes and return its pixel array.
+    
+    Accepts bytes (not UploadedFile) so st.cache_data can hash it.
+    Using force=True for robustness with files missing the DICOM preamble.
+    """
+    import io as _io
+    dcm = pyd.dcmread(_io.BytesIO(file_bytes), force=True)
+    return dcm.pixel_array
+
+@st.cache_data(show_spinner=False)
+def load_dicom_meta(file_bytes: bytes) -> tuple:
+    """Return (pixel_array, patient_name, birth_date, acq_date) from raw bytes."""
+    import io as _io
+    dcm = pyd.dcmread(_io.BytesIO(file_bytes), force=True)
+    patient_name, birth_date, acq_date = extract_patient_info(dcm)
+    return dcm.pixel_array, patient_name, birth_date, acq_date
+
+@st.cache_data(show_spinner=False)
+def compute_uptake_masks(ref_pixels: np.ndarray,
+                         threshold_pct: float,
+                         expansion_x: float,
+                         expansion_y: float) -> tuple:
+    """Derive the three masks from the reference image.  Cached so that
+    changing a sidebar slider in an unrelated section does not recompute."""
+    mask1, threshold_value = create_threshold_mask(ref_pixels, threshold_pct)
+    mask2, rectangle_coords = find_inscribed_rectangle(mask1)
+    mask3, expanded_coords = expand_rectangle(rectangle_coords, ref_pixels.shape,
+                                              expansion_x, expansion_y)
+    return mask1, mask2, mask3, expanded_coords, threshold_value
+
+@st.cache_data(show_spinner=False)
+def compute_all_rawintden(
+    thy4_bytes, bg4_bytes, ph4_bytes,
+    thy24_bytes, bg24_bytes, ph24_bytes,
+    mask3: np.ndarray
+) -> dict:
+    """Read all six DICOM files and compute RawIntDen in one cached call.
+    
+    Bundling all six files avoids six separate cache misses and ensures the
+    heavy ndimage_shift calls are only repeated when the files actually change.
+    """
+    import io as _io
+
+    def read_pixels(b):
+        return pyd.dcmread(_io.BytesIO(b), force=True).pixel_array
+
+    thy4_img  = read_pixels(thy4_bytes)
+    bg4_img   = read_pixels(bg4_bytes)
+    ph4_img   = read_pixels(ph4_bytes)
+    thy24_img = read_pixels(thy24_bytes)
+    bg24_img  = read_pixels(bg24_bytes)
+    ph24_img  = read_pixels(ph24_bytes)
+
+    rid_thy4,  mask_thy4,  shift_thy4,  roi_thy4  = compute_rawintden_centered(thy4_img,  mask3)
+    rid_bg4,   mask_bg4,   shift_bg4,   roi_bg4   = compute_rawintden_centered(bg4_img,   mask3)
+    rid_ph4,   mask_ph4,   shift_ph4,   roi_ph4   = compute_rawintden_centered(ph4_img,   mask3)
+    rid_thy24, mask_thy24, shift_thy24, roi_thy24 = compute_rawintden_centered(thy24_img, mask3)
+    rid_bg24,  mask_bg24,  shift_bg24,  roi_bg24  = compute_rawintden_centered(bg24_img,  mask3)
+    rid_ph24,  mask_ph24,  shift_ph24,  roi_ph24  = compute_rawintden_centered(ph24_img,  mask3)
+
+    return dict(
+        thy4_img=thy4_img,   bg4_img=bg4_img,   ph4_img=ph4_img,
+        thy24_img=thy24_img, bg24_img=bg24_img, ph24_img=ph24_img,
+        rid_thy4=rid_thy4,   rid_bg4=rid_bg4,   rid_ph4=rid_ph4,
+        rid_thy24=rid_thy24, rid_bg24=rid_bg24, rid_ph24=rid_ph24,
+        mask_thy4=mask_thy4, mask_bg4=mask_bg4, mask_ph4=mask_ph4,
+        mask_thy24=mask_thy24, mask_bg24=mask_bg24, mask_ph24=mask_ph24,
+        shift_thy4=shift_thy4, shift_bg4=shift_bg4, shift_ph4=shift_ph4,
+        shift_thy24=shift_thy24, shift_bg24=shift_bg24, shift_ph24=shift_ph24,
+        roi_thy4=roi_thy4, roi_bg4=roi_bg4, roi_ph4=roi_ph4,
+        roi_thy24=roi_thy24, roi_bg24=roi_bg24, roi_ph24=roi_ph24,
+    )
+
 # ==================== MAIN APP ====================
 
 if analysis_mode == "Volume & Ellipse Fitting":
@@ -641,7 +733,10 @@ if analysis_mode == "Volume & Ellipse Fitting":
     
     if uploaded_file is not None:
         try:
-            dcm = pyd.dcmread(uploaded_file)
+            # Read the file bytes once; dcmread + pixel_array extraction are
+            # both cached so button clicks do not re-run the heavy pipeline.
+            file_bytes = uploaded_file.read()
+            dcm = pyd.dcmread(io.BytesIO(file_bytes), force=True)
             
             pixel_spacing_row, pixel_spacing_col = extract_pixel_spacing(dcm)
             if pixel_spacing_row is not None:
@@ -653,11 +748,11 @@ if analysis_mode == "Volume & Ellipse Fitting":
             
             with st.spinner("Analyzing volume image..."):
                 results, error = analyze_volume_image(
-                    dcm, 
-                    threshold_volume, 
-                    profile_smoothing, 
-                    smooth_kernel_size, 
-                    padding_width, 
+                    dcm.pixel_array,
+                    threshold_volume,
+                    profile_smoothing,
+                    smooth_kernel_size,
+                    padding_width,
                     local_mean_radius
                 )
             
@@ -675,7 +770,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax1.set_title('Original Volume Image')
                     ax1.axis('off')
                     st.pyplot(fig1)
-                    plt.close()
+                    plt.close(fig1)
                 
                 with col2:
                     fig2, ax2 = plt.subplots(figsize=(6, 5))
@@ -684,7 +779,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax2.axis('off')
                     plt.colorbar(im, ax=ax2, shrink=0.7)
                     st.pyplot(fig2)
-                    plt.close()
+                    plt.close(fig2)
                 
                 with col3:
                     fig3, ax3 = plt.subplots(figsize=(6, 5))
@@ -695,7 +790,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax3.axis('off')
                     plt.colorbar(im, ax=ax3, shrink=0.7)
                     st.pyplot(fig3)
-                    plt.close()
+                    plt.close(fig3)
                 
                 st.warning("Warning: the system of reference is the standard radiological (e.g. left of the image is right of the patient, called \"right\" lobe here)")
                 st.subheader("Profile Analysis")
@@ -715,7 +810,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax4.legend()
                     ax4.grid(True, alpha=0.3)
                     st.pyplot(fig4)
-                    plt.close()
+                    plt.close(fig4)
                 
                 with col2:
                     #st.metric("Split Index", results['idx_min'])
@@ -736,7 +831,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax5.axis('off')
                     plt.colorbar(im, ax=ax5, shrink=0.7)
                     st.pyplot(fig5)
-                    plt.close()
+                    plt.close(fig5)
                 
                 with col2:
                     fig6, ax6 = plt.subplots(figsize=(6, 5))
@@ -747,7 +842,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax6.axis('off')
                     plt.colorbar(im, ax=ax6, shrink=0.7)
                     st.pyplot(fig6)
-                    plt.close()
+                    plt.close(fig6)
                 
                 st.subheader("Ellipse Fitting Results")
                 col1, col2 = st.columns(2)
@@ -762,7 +857,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax7.set_title('Right Ellipse Fit')
                     ax7.axis('off')
                     st.pyplot(fig7)
-                    plt.close()
+                    plt.close(fig7)
                     
                     st.write(f"**Center:** ({center_sx[0]:.1f}, {center_sx[1]:.1f})")
                     st.write(f"**Semi-major axis (a):** {a_sx:.1f} px")
@@ -794,7 +889,7 @@ if analysis_mode == "Volume & Ellipse Fitting":
                     ax8.set_title('Left Ellipse Fit')
                     ax8.axis('off')
                     st.pyplot(fig8)
-                    plt.close()
+                    plt.close(fig8)
 
                     st.write(f"**Center:** ({center_dx[0]:.1f}, {center_dx[1]:.1f})")
                     st.write(f"**Semi-major axis (a):** {a_dx:.1f} px")
@@ -892,14 +987,12 @@ elif analysis_mode == "Thyroid Uptake Analysis":
     
     st.markdown("""
     Upload DICOM files for thyroid uptake calculation. The app expects:
-    - Reference file (Tiroide) to create the ROI mask
     - Thyroid (Tiroide) images at 4h and 24h
     - Background (Fondo) images at 4h and 24h
     - Phantom (Fantoccio) images at 4h and 24h
+
+    After uploading all 6 files, you can choose which thyroid image to use for ROI mask creation.
     """)
-    
-    st.subheader("Upload Thyroid Reference File")
-    reference_file = st.file_uploader("Reference DICOM (for mask creation)", type=['dcm'], key='ref')
     
     st.subheader("Upload 4-hour Images")
     col1, col2, col3 = st.columns(3)
@@ -918,14 +1011,45 @@ elif analysis_mode == "Thyroid Uptake Analysis":
         background_24h = st.file_uploader("Background 24H", type=['dcm'], key='bg24')
     with col3:
         phantom_24h = st.file_uploader("Phantom 24H", type=['dcm'], key='ph24')
-    
-    if reference_file is not None:
-        try:
-            ref_dcm = pyd.dcmread(reference_file)
-            ref_image = ref_dcm.pixel_array
 
-            # Extract patient information from reference DICOM
-            patient_name, birth_date, acq_date_ref = extract_patient_info(ref_dcm)
+    all_files_present = all([
+        thyroid_4h, background_4h, phantom_4h,
+        thyroid_24h, background_24h, phantom_24h
+    ])
+
+    if all_files_present:
+        st.markdown("---")
+        st.subheader("ROI Mask Reference Selection")
+        reference_choice = st.radio(
+            "Select which thyroid image to use for ROI mask creation:",
+            options=["Thyroid 4H", "Thyroid 24H"],
+            index=0,
+            horizontal=True,
+            help="The selected image will be used to define the thyroid ROI mask applied to all acquisitions."
+        )
+
+        reference_file = thyroid_4h if reference_choice == "Thyroid 4H" else thyroid_24h
+
+    if not all_files_present:
+        st.info("Upload all 6 DICOM files above to proceed. Once complete, you will be able to select which thyroid image to use for ROI mask creation.")
+
+    if all_files_present:
+        try:
+            # Read each file to bytes once — cached helpers take it from here.
+            # UploadedFile.read() is only called once per run; after that
+            # all heavy work is served from the st.cache_data store.
+            thy4_bytes  = thyroid_4h.read()
+            thy24_bytes = thyroid_24h.read()
+            bg4_bytes   = background_4h.read()
+            bg24_bytes  = background_24h.read()
+            ph4_bytes   = phantom_4h.read()
+            ph24_bytes  = phantom_24h.read()
+
+            ref_bytes = thy4_bytes if reference_choice == "Thyroid 4H" else thy24_bytes
+
+            # load_dicom_meta is cached: re-runs only when the bytes change
+            ref_image, patient_name, birth_date, acq_date_ref = load_dicom_meta(ref_bytes)
+
             st.session_state.patient_name = patient_name
             st.session_state.patient_birth_date = birth_date
 
@@ -933,28 +1057,28 @@ elif analysis_mode == "Thyroid Uptake Analysis":
             st.info(f"Patient: {patient_name} | Birth Date: {birth_date}")
 
             st.subheader("Reference Image and Mask Creation")
-            
-            mask1, threshold_value = create_threshold_mask(ref_image, threshold_percentage)
-            mask2, rectangle_coords = find_inscribed_rectangle(mask1)
-            mask3, expanded_coords = expand_rectangle(
-                rectangle_coords, ref_image.shape, expansion_x, expansion_y
+
+            # compute_uptake_masks is cached: mask recomputation only happens
+            # when the reference image or sidebar sliders actually change.
+            mask1, mask2, mask3, expanded_coords, threshold_value = compute_uptake_masks(
+                ref_image, threshold_percentage, expansion_x, expansion_y
             )
             
             col1, col2, col3, col4 = st.columns(4)
-            
+
             def create_rgba_mask(mask, alpha=0.5):
                 rgba = np.zeros((*mask.shape, 4))
                 rgba[mask] = [1, 0, 0, alpha]
                 return rgba
-            
+
             with col1:
                 fig, ax = plt.subplots(figsize=(4, 4))
                 ax.imshow(ref_image, cmap='gray')
-                ax.set_title('Reference Image')
+                ax.set_title(f'Reference Image ({reference_choice})')
                 ax.axis('off')
                 st.pyplot(fig)
-                plt.close()
-            
+                plt.close(fig)
+
             with col2:
                 fig, ax = plt.subplots(figsize=(4, 4))
                 ax.imshow(ref_image, cmap='gray')
@@ -962,8 +1086,8 @@ elif analysis_mode == "Thyroid Uptake Analysis":
                 ax.set_title(f'Threshold >{threshold_percentage*100:.0f}%')
                 ax.axis('off')
                 st.pyplot(fig)
-                plt.close()
-            
+                plt.close(fig)
+
             with col3:
                 fig, ax = plt.subplots(figsize=(4, 4))
                 ax.imshow(ref_image, cmap='gray')
@@ -971,8 +1095,8 @@ elif analysis_mode == "Thyroid Uptake Analysis":
                 ax.set_title('Inscribed Rectangle')
                 ax.axis('off')
                 st.pyplot(fig)
-                plt.close()
-            
+                plt.close(fig)
+
             with col4:
                 fig, ax = plt.subplots(figsize=(4, 4))
                 ax.imshow(ref_image, cmap='gray')
@@ -980,268 +1104,255 @@ elif analysis_mode == "Thyroid Uptake Analysis":
                 ax.set_title(f'Expanded +{expansion_x*100:.0f}%')
                 ax.axis('off')
                 st.pyplot(fig)
-                plt.close()
+                plt.close(fig)
             
             st.info(f"Mask contains {np.sum(mask3)} pixels. Rectangle coords: x=[{expanded_coords[0]}, {expanded_coords[1]}], y=[{expanded_coords[2]}, {expanded_coords[3]}]")
-            
-            all_files_present = all([
-                thyroid_4h, background_4h, phantom_4h,
-                thyroid_24h, background_24h, phantom_24h
-            ])
-            
-            if all_files_present:
-                st.subheader("RawIntDen Calculations")
 
-                # Extract acquisition dates from thyroid images
-                thy4_dcm = pyd.dcmread(thyroid_4h)
-                thy24_dcm = pyd.dcmread(thyroid_24h)
+            st.subheader("RawIntDen Calculations")
 
-                _, _, acq_date_4h = extract_patient_info(thy4_dcm)
-                _, _, acq_date_24h = extract_patient_info(thy24_dcm)
+            # Extract acquisition dates from the thyroid DICOM metadata.
+            # load_dicom_meta is cached, so no file re-read occurs here.
+            # Returns (pixel_array, patient_name, birth_date, acq_date)
+            _, _, _, acq_date_4h  = load_dicom_meta(thy4_bytes)
+            _, _, _, acq_date_24h = load_dicom_meta(thy24_bytes)
 
-                # Format acquisition dates for report (e.g., "05-10/10/2022")
-                if acq_date_4h and acq_date_24h:
-                    # Extract day and month from both dates
-                    # Format: DD/MM/YYYY
-                    day_4h = acq_date_4h.split('/')[0]
-                    day_24h = acq_date_24h.split('/')[0]
-                    month = acq_date_4h.split('/')[1]
-                    year = acq_date_4h.split('/')[2]
-                    acquisition_dates_formatted = f"{day_4h}-{day_24h}/{month}/{year}"
-                    st.session_state.acquisition_dates = acquisition_dates_formatted
-                    st.info(f"Acquisition dates: {acquisition_dates_formatted}")
+            if acq_date_4h and acq_date_24h:
+                day_4h  = acq_date_4h.split('/')[0]
+                day_24h = acq_date_24h.split('/')[0]
+                month   = acq_date_4h.split('/')[1]
+                year    = acq_date_4h.split('/')[2]
+                acquisition_dates_formatted = f"{day_4h}-{day_24h}/{month}/{year}"
+                st.session_state.acquisition_dates = acquisition_dates_formatted
+                st.info(f"Acquisition dates: {acquisition_dates_formatted}")
 
-                thy4_img = thy4_dcm.pixel_array
-                bg4_img = pyd.dcmread(background_4h).pixel_array
-                ph4_img = pyd.dcmread(phantom_4h).pixel_array
-                
-                rawintden_thy4, mask_thy4, shift_thy4, roi_thy4 = compute_rawintden_centered(thy4_img, mask3)
-                rawintden_bg4, mask_bg4, shift_bg4, roi_bg4 = compute_rawintden_centered(bg4_img, mask3)
-                rawintden_ph4, mask_ph4, shift_ph4, roi_ph4 = compute_rawintden_centered(ph4_img, mask3)
+            # compute_all_rawintden is cached: the six ndimage_shift calls
+            # only re-run when a file or the mask actually changes.
+            rd = compute_all_rawintden(
+                thy4_bytes, bg4_bytes, ph4_bytes,
+                thy24_bytes, bg24_bytes, ph24_bytes,
+                mask3
+            )
+            thy4_img   = rd['thy4_img'];  bg4_img   = rd['bg4_img'];  ph4_img   = rd['ph4_img']
+            thy24_img  = rd['thy24_img']; bg24_img  = rd['bg24_img']; ph24_img  = rd['ph24_img']
+            rawintden_thy4  = rd['rid_thy4'];  rawintden_bg4  = rd['rid_bg4'];  rawintden_ph4  = rd['rid_ph4']
+            rawintden_thy24 = rd['rid_thy24']; rawintden_bg24 = rd['rid_bg24']; rawintden_ph24 = rd['rid_ph24']
+            mask_thy4  = rd['mask_thy4'];  mask_bg4  = rd['mask_bg4'];  mask_ph4  = rd['mask_ph4']
+            mask_thy24 = rd['mask_thy24']; mask_bg24 = rd['mask_bg24']; mask_ph24 = rd['mask_ph24']
+            shift_thy4  = rd['shift_thy4'];  shift_bg4  = rd['shift_bg4'];  shift_ph4  = rd['shift_ph4']
+            shift_thy24 = rd['shift_thy24']; shift_bg24 = rd['shift_bg24']; shift_ph24 = rd['shift_ph24']
+            roi_thy4  = rd['roi_thy4'];  roi_bg4  = rd['roi_bg4'];  roi_ph4  = rd['roi_ph4']
+            roi_thy24 = rd['roi_thy24']; roi_bg24 = rd['roi_bg24']; roi_ph24 = rd['roi_ph24']
 
-                thy24_img = thy24_dcm.pixel_array
-                bg24_img = pyd.dcmread(background_24h).pixel_array
-                ph24_img = pyd.dcmread(phantom_24h).pixel_array
-                
-                rawintden_thy24, mask_thy24, shift_thy24, roi_thy24 = compute_rawintden_centered(thy24_img, mask3)
-                rawintden_bg24, mask_bg24, shift_bg24, roi_bg24 = compute_rawintden_centered(bg24_img, mask3)
-                rawintden_ph24, mask_ph24, shift_ph24, roi_ph24 = compute_rawintden_centered(ph24_img, mask3)
-                
-                st.markdown("### 4-Hour Acquisitions")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(thy4_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_thy4, mask_opacity))
-                    ax.set_title('Thyroid 4H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_thy4:.0f}")
-                    st.caption(f"Shift: Δx={shift_thy4[1]:.1f}, Δy={shift_thy4[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_thy4):.2f}")
-                
-                with col2:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(bg4_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_bg4, mask_opacity))
-                    ax.set_title('Background 4H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_bg4:.0f}")
-                    st.caption(f"Shift: Δx={shift_bg4[1]:.1f}, Δy={shift_bg4[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_bg4):.2f}")
-                
-                with col3:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(ph4_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_ph4, mask_opacity))
-                    ax.set_title('Phantom 4H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_ph4:.0f}")
-                    st.caption(f"Shift: Δx={shift_ph4[1]:.1f}, Δy={shift_ph4[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_ph4):.2f}")
-                
-                st.markdown("### 24-Hour Acquisitions")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(thy24_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_thy24, mask_opacity))
-                    ax.set_title('Thyroid 24H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_thy24:.0f}")
-                    st.caption(f"Shift: Δx={shift_thy24[1]:.1f}, Δy={shift_thy24[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_thy24):.2f}")
-                
-                with col2:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(bg24_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_bg24, mask_opacity))
-                    ax.set_title('Background 24H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_bg24:.0f}")
-                    st.caption(f"Shift: Δx={shift_bg24[1]:.1f}, Δy={shift_bg24[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_bg24):.2f}")
-                
-                with col3:
-                    fig, ax = plt.subplots(figsize=(4, 4))
-                    ax.imshow(ph24_img, cmap='gray')
-                    ax.imshow(create_rgba_mask(mask_ph24, mask_opacity))
-                    ax.set_title('Phantom 24H')
-                    ax.axis('off')
-                    st.pyplot(fig)
-                    plt.close()
-                    st.metric("RawIntDen", f"{rawintden_ph24:.0f}")
-                    st.caption(f"Shift: Δx={shift_ph24[1]:.1f}, Δy={shift_ph24[0]:.1f}")
-                    st.caption(f"Mean intensity: {np.mean(roi_ph24):.2f}")
-                
-                st.subheader("Radioactive Decay Corrections")
-                
-                decay_4h = calculate_decay_factor(4, halflife_hours)
-                decay_24h = calculate_decay_factor(24, halflife_hours)
-                
-                phantom_4h_corrected = rawintden_ph4 / decay_4h
-                phantom_24h_corrected = rawintden_ph24 / decay_24h
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Decay factor at 4h", f"{decay_4h:.6f}")
-                    st.metric("Phantom 4H (decay corrected)", f"{phantom_4h_corrected:.0f}")
-                
-                with col2:
-                    st.metric("Decay factor at 24h", f"{decay_24h:.6f}")
-                    st.metric("Phantom 24H (decay corrected)", f"{phantom_24h_corrected:.0f}")
-                
-                variation = (phantom_24h_corrected - phantom_4h_corrected) / phantom_4h_corrected * 100
-                st.info(f"Variation between decay-corrected phantoms: {variation:.2f}%")
-                
-                st.subheader("Thyroid Uptake Results")
+            st.markdown("### 4-Hour Acquisitions")
+            col1, col2, col3 = st.columns(3)
 
-
-                
-                st.markdown("""
-                The thyroid uptake is calculated as a percentage of the administered dose using the following methodology:
-                """)
-                
-                # LaTeX formatted formula
-                st.latex(r"Uptake\% = \left( \frac{RawIntDen_{Thyroid} - RawIntDen_{Background}}{RawIntDen_{PhantomCorrected}} \right) \times 100")
-                
-                st.markdown("""
-                **Normalization Methods:**
-                You can choose between two normalization values:
-                * **4H Phantom Normalization:** Uses the phantom measured at 4 hours to normalize the uptake.
-                * **24H Phantom Normalization:** Uses the phantom measured at 24 hours to normalize the uptake. 
-                If the phantom acquisitions were performed without issues, the two value corrected for decay should ideally be the same.
-                
-                **Decay Correction:**
-                The $PhantomCorrected$ value accounts for the radioactive decay of the isotope between the time of dose administration and the time of measurement (4h or 24h) using the provided half-life.
-                """)
-                
-                st.markdown("#### Using Phantom 24H for normalization:")
-                uptake_4h_with_24h = (rawintden_thy4 - rawintden_bg4) / phantom_24h_corrected * 100
-                uptake_24h_with_24h = (rawintden_thy24 - rawintden_bg24) / phantom_24h_corrected * 100
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Uptake at 4 hours", f"{uptake_4h_with_24h:.1f}%", 
-                             delta=None, delta_color="off")
-                with col2:
-                    st.metric("Uptake at 24 hours", f"{uptake_24h_with_24h:.1f}%",
-                             delta=None, delta_color="off")
-                with col3:
-                    if st.button("💾 Save Uptake (24H Phantom)", key="save_uptake_24h"):
-                        st.session_state.uptake_4h = uptake_4h_with_24h
-                        st.session_state.uptake_24h = uptake_24h_with_24h
-                        st.success("Uptake data (24H phantom) saved!")
-                
-                st.markdown("#### Using Phantom 4H for normalization:")
-                uptake_4h_with_4h = (rawintden_thy4 - rawintden_bg4) / phantom_4h_corrected * 100
-                uptake_24h_with_4h = (rawintden_thy24 - rawintden_bg24) / phantom_4h_corrected * 100
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Uptake at 4 hours", f"{uptake_4h_with_4h:.1f}%",
-                             delta=None, delta_color="off")
-                with col2:
-                    st.metric("Uptake at 24 hours", f"{uptake_24h_with_4h:.1f}%",
-                             delta=None, delta_color="off")
-                with col3:
-                    if st.button("💾 Save Uptake (4H Phantom)", key="save_uptake_4h"):
-                        st.session_state.uptake_4h = uptake_4h_with_4h
-                        st.session_state.uptake_24h = uptake_24h_with_4h
-                        st.success("Uptake data (4H phantom) saved!")
-                
-                st.subheader("Summary Table")
-                import pandas as pd
-                
-                summary_data = {
-                    'Measurement': [
-                        'Thyroid 4H', 'Background 4H', 'Phantom 4H',
-                        'Thyroid 24H', 'Background 24H', 'Phantom 24H'
-                    ],
-                    'RawIntDen': [
-                        rawintden_thy4, rawintden_bg4, rawintden_ph4,
-                        rawintden_thy24, rawintden_bg24, rawintden_ph24
-                    ],
-                    'Mean Intensity': [
-                        np.mean(roi_thy4), np.mean(roi_bg4), np.mean(roi_ph4),
-                        np.mean(roi_thy24), np.mean(roi_bg24), np.mean(roi_ph24)
-                    ],
-                    'Num Pixels': [
-                        np.sum(mask_thy4), np.sum(mask_bg4), np.sum(mask_ph4),
-                        np.sum(mask_thy24), np.sum(mask_bg24), np.sum(mask_ph24)
-                    ]
-                }
-                
-                df = pd.DataFrame(summary_data)
-                st.dataframe(df, use_container_width=True)
-                
-                st.subheader("Uptake Comparison Chart")
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                
-                time_points = ['4 hours', '24 hours']
-                uptake_24h_norm = [uptake_4h_with_24h, uptake_24h_with_24h]
-                uptake_4h_norm = [uptake_4h_with_4h, uptake_24h_with_4h]
-                
-                x = np.arange(len(time_points))
-                width = 0.35
-                
-                bars1 = ax.bar(x - width/2, uptake_24h_norm, width, 
-                              label='Normalized with Phantom 24H', alpha=0.8)
-                bars2 = ax.bar(x + width/2, uptake_4h_norm, width, 
-                              label='Normalized with Phantom 4H', alpha=0.8)
-                
-                ax.set_ylabel('Uptake (%)')
-                ax.set_title('Thyroid Uptake Comparison')
-                ax.set_xticks(x)
-                ax.set_xticklabels(time_points)
-                ax.legend()
-                ax.grid(True, alpha=0.3, axis='y')
-                
-                for bars in [bars1, bars2]:
-                    for bar in bars:
-                        height = bar.get_height()
-                        ax.text(bar.get_x() + bar.get_width()/2., height,
-                               f'{height:.1f}%',
-                               ha='center', va='bottom', fontsize=9)
-                
+            with col1:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(thy4_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_thy4, mask_opacity))
+                ax.set_title('Thyroid 4H')
+                ax.axis('off')
                 st.pyplot(fig)
-                plt.close()
-                
-            else:
-                st.warning("Please upload all required files (thyroid, background, and phantom at both 4h and 24h) to perform uptake calculations.")
-        
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_thy4:.0f}")
+                st.caption(f"Shift: Δx={shift_thy4[1]:.1f}, Δy={shift_thy4[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_thy4):.2f}")
+
+            with col2:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(bg4_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_bg4, mask_opacity))
+                ax.set_title('Background 4H')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_bg4:.0f}")
+                st.caption(f"Shift: Δx={shift_bg4[1]:.1f}, Δy={shift_bg4[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_bg4):.2f}")
+
+            with col3:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(ph4_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_ph4, mask_opacity))
+                ax.set_title('Phantom 4H')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_ph4:.0f}")
+                st.caption(f"Shift: Δx={shift_ph4[1]:.1f}, Δy={shift_ph4[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_ph4):.2f}")
+
+            st.markdown("### 24-Hour Acquisitions")
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(thy24_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_thy24, mask_opacity))
+                ax.set_title('Thyroid 24H')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_thy24:.0f}")
+                st.caption(f"Shift: Δx={shift_thy24[1]:.1f}, Δy={shift_thy24[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_thy24):.2f}")
+
+            with col2:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(bg24_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_bg24, mask_opacity))
+                ax.set_title('Background 24H')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_bg24:.0f}")
+                st.caption(f"Shift: Δx={shift_bg24[1]:.1f}, Δy={shift_bg24[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_bg24):.2f}")
+
+            with col3:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.imshow(ph24_img, cmap='gray')
+                ax.imshow(create_rgba_mask(mask_ph24, mask_opacity))
+                ax.set_title('Phantom 24H')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
+                st.metric("RawIntDen", f"{rawintden_ph24:.0f}")
+                st.caption(f"Shift: Δx={shift_ph24[1]:.1f}, Δy={shift_ph24[0]:.1f}")
+                st.caption(f"Mean intensity: {np.mean(roi_ph24):.2f}")
+
+            st.subheader("Radioactive Decay Corrections")
+
+            decay_4h = calculate_decay_factor(4, halflife_hours)
+            decay_24h = calculate_decay_factor(24, halflife_hours)
+
+            phantom_4h_corrected = rawintden_ph4 / decay_4h
+            phantom_24h_corrected = rawintden_ph24 / decay_24h
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Decay factor at 4h", f"{decay_4h:.6f}")
+                st.metric("Phantom 4H (decay corrected)", f"{phantom_4h_corrected:.0f}")
+
+            with col2:
+                st.metric("Decay factor at 24h", f"{decay_24h:.6f}")
+                st.metric("Phantom 24H (decay corrected)", f"{phantom_24h_corrected:.0f}")
+
+            variation = (phantom_24h_corrected - phantom_4h_corrected) / phantom_4h_corrected * 100
+            st.info(f"Variation between decay-corrected phantoms: {variation:.2f}%")
+
+            st.subheader("Thyroid Uptake Results")
+
+            st.markdown("""
+            The thyroid uptake is calculated as a percentage of the administered dose using the following methodology:
+            """)
+
+            # LaTeX formatted formula
+            st.latex(r"Uptake\% = \left( \frac{RawIntDen_{Thyroid} - RawIntDen_{Background}}{RawIntDen_{PhantomCorrected}} \right) \times 100")
+
+            st.markdown("""
+            **Normalization Methods:**
+            You can choose between two normalization values:
+            * **4H Phantom Normalization:** Uses the phantom measured at 4 hours to normalize the uptake.
+            * **24H Phantom Normalization:** Uses the phantom measured at 24 hours to normalize the uptake. 
+            If the phantom acquisitions were performed without issues, the two value corrected for decay should ideally be the same.
+            
+            **Decay Correction:**
+            The $PhantomCorrected$ value accounts for the radioactive decay of the isotope between the time of dose administration and the time of measurement (4h or 24h) using the provided half-life.
+            """)
+
+            st.markdown("#### Using Phantom 24H for normalization:")
+            uptake_4h_with_24h = (rawintden_thy4 - rawintden_bg4) / phantom_24h_corrected * 100
+            uptake_24h_with_24h = (rawintden_thy24 - rawintden_bg24) / phantom_24h_corrected * 100
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Uptake at 4 hours", f"{uptake_4h_with_24h:.1f}%",
+                         delta=None, delta_color="off")
+            with col2:
+                st.metric("Uptake at 24 hours", f"{uptake_24h_with_24h:.1f}%",
+                         delta=None, delta_color="off")
+            with col3:
+                if st.button("💾 Save Uptake (24H Phantom)", key="save_uptake_24h"):
+                    st.session_state.uptake_4h = uptake_4h_with_24h
+                    st.session_state.uptake_24h = uptake_24h_with_24h
+                    st.success("Uptake data (24H phantom) saved!")
+
+            st.markdown("#### Using Phantom 4H for normalization:")
+            uptake_4h_with_4h = (rawintden_thy4 - rawintden_bg4) / phantom_4h_corrected * 100
+            uptake_24h_with_4h = (rawintden_thy24 - rawintden_bg24) / phantom_4h_corrected * 100
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Uptake at 4 hours", f"{uptake_4h_with_4h:.1f}%",
+                         delta=None, delta_color="off")
+            with col2:
+                st.metric("Uptake at 24 hours", f"{uptake_24h_with_4h:.1f}%",
+                         delta=None, delta_color="off")
+            with col3:
+                if st.button("💾 Save Uptake (4H Phantom)", key="save_uptake_4h"):
+                    st.session_state.uptake_4h = uptake_4h_with_4h
+                    st.session_state.uptake_24h = uptake_24h_with_4h
+                    st.success("Uptake data (4H phantom) saved!")
+
+            st.subheader("Summary Table")
+            import pandas as pd
+
+            summary_data = {
+                'Measurement': [
+                    'Thyroid 4H', 'Background 4H', 'Phantom 4H',
+                    'Thyroid 24H', 'Background 24H', 'Phantom 24H'
+                ],
+                'RawIntDen': [
+                    rawintden_thy4, rawintden_bg4, rawintden_ph4,
+                    rawintden_thy24, rawintden_bg24, rawintden_ph24
+                ],
+                'Mean Intensity': [
+                    np.mean(roi_thy4), np.mean(roi_bg4), np.mean(roi_ph4),
+                    np.mean(roi_thy24), np.mean(roi_bg24), np.mean(roi_ph24)
+                ],
+                'Num Pixels': [
+                    np.sum(mask_thy4), np.sum(mask_bg4), np.sum(mask_ph4),
+                    np.sum(mask_thy24), np.sum(mask_bg24), np.sum(mask_ph24)
+                ]
+            }
+
+            df = pd.DataFrame(summary_data)
+            st.dataframe(df, use_container_width=True)
+
+            st.subheader("Uptake Comparison Chart")
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            time_points = ['4 hours', '24 hours']
+            uptake_24h_norm = [uptake_4h_with_24h, uptake_24h_with_24h]
+            uptake_4h_norm = [uptake_4h_with_4h, uptake_24h_with_4h]
+
+            x = np.arange(len(time_points))
+            width = 0.35
+
+            bars1 = ax.bar(x - width/2, uptake_24h_norm, width,
+                          label='Normalized with Phantom 24H', alpha=0.8)
+            bars2 = ax.bar(x + width/2, uptake_4h_norm, width,
+                          label='Normalized with Phantom 4H', alpha=0.8)
+
+            ax.set_ylabel('Uptake (%)')
+            ax.set_title('Thyroid Uptake Comparison')
+            ax.set_xticks(x)
+            ax.set_xticklabels(time_points)
+            ax.legend()
+            ax.grid(True, alpha=0.3, axis='y')
+
+            for bars in [bars1, bars2]:
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.1f}%',
+                           ha='center', va='bottom', fontsize=9)
+
+            st.pyplot(fig)
+            plt.close(fig)
+
         except Exception as e:
             st.error(f"Error processing files: {str(e)}")
             import traceback
