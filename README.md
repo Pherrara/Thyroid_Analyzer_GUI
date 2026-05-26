@@ -202,7 +202,7 @@ Python ≥ 3.9
 Install dependencies:
 
 ```bash
-pip install streamlit numpy scipy matplotlib pydicom opencv-python
+pip install streamlit numpy scipy matplotlib pydicom opencv-python pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg
 ```
 
 ---
